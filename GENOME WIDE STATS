@@ -1,0 +1,220 @@
+"""
+MASTER INSILICO TARGET CAPTURE PIPELINE
+
+INPUT:
+ genome.fasta
+ genes.bed
+ exons.bed
+ probes.fasta
+
+OUTPUT:
+ captured_genes.fasta
+ simulated_reads.fastq
+ capture_stats.csv
+ plots/*
+"""
+
+import os
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from Bio import SeqIO
+from Bio.Seq import Seq
+from Bio.SeqUtils import gc_fraction
+from Bio.SeqRecord import SeqRecord
+
+# =====================================
+# SETUP
+# =====================================
+
+os.makedirs("plots", exist_ok=True)
+random.seed(42)
+np.random.seed(42)
+
+# =====================================
+# LOAD FILES
+# =====================================
+
+genome = SeqIO.to_dict(SeqIO.parse("genome.fasta", "fasta"))
+
+genes = pd.read_csv(
+    "genes.bed",
+    sep="\t",
+    header=None,
+    names=["chr","start","end","gene"]
+)
+
+exons = pd.read_csv(
+    "exons.bed",
+    sep="\t",
+    header=None,
+    names=["chr","start","end","gene"]
+)
+
+probes = list(SeqIO.parse("probes.fasta", "fasta"))
+
+# =====================================
+# HELPER FUNCTIONS
+# =====================================
+
+def mismatches(a, b):
+    return sum(x != y for x, y in zip(a, b))
+
+def simulate_reads(seq, n_reads=100, read_len=150):
+    reads = []
+    for _ in range(n_reads):
+        if len(seq) < read_len:
+            continue
+        s = random.randint(0, len(seq)-read_len)
+        r = seq[s:s+read_len]
+        reads.append(r)
+    return reads
+
+# =====================================
+# PROBE-BASED CAPTURE SIMULATION
+# =====================================
+
+CAPTURED = []
+stats = []
+
+MAX_MISMATCH = 3
+
+for _, row in genes.iterrows():
+
+    chrom, start, end, gene = row
+    seq = genome[chrom].seq[start:end]
+
+    matched = False
+
+    for probe in probes:
+        for i in range(0, len(seq) - len(probe.seq)):
+            window = seq[i:i+len(probe.seq)]
+            if mismatches(window, probe.seq) <= MAX_MISMATCH:
+                matched = True
+                break
+        if matched:
+            break
+
+    if matched:
+
+        CAPTURED.append(
+            SeqRecord(seq, id=gene,
+                      description=f"{chrom}:{start}-{end}")
+        )
+
+        stats.append({
+            "gene": gene,
+            "chr": chrom,
+            "length": len(seq),
+            "GC": gc_fraction(seq) * 100
+        })
+
+SeqIO.write(CAPTURED, "captured_genes.fasta", "fasta")
+
+stats_df = pd.DataFrame(stats)
+stats_df.to_csv("capture_stats.csv", index=False)
+
+# =====================================
+# READ SIMULATION + COVERAGE
+# =====================================
+
+all_reads = []
+coverage = {}
+
+for rec in CAPTURED:
+
+    reads = simulate_reads(rec.seq, 300)
+
+    coverage[rec.id] = len(reads)
+
+    for i, r in enumerate(reads):
+        all_reads.append(
+            SeqRecord(
+                r,
+                id=f"{rec.id}_{i}",
+                description=""
+            )
+        )
+
+SeqIO.write(all_reads, "simulated_reads.fastq", "fastq")
+
+# =====================================
+# COVERAGE TABLE
+# =====================================
+
+cov_df = pd.DataFrame.from_dict(
+    coverage,
+    orient="index",
+    columns=["read_count"]
+)
+
+cov_df.to_csv("gene_coverage.csv")
+
+# =====================================
+# ---------- PLOTTING -----------------
+# =====================================
+
+# LENGTH DISTRIBUTION
+plt.figure()
+stats_df["length"].hist(bins=40)
+plt.title("Captured Gene Lengths")
+plt.xlabel("bp")
+plt.ylabel("Count")
+plt.savefig("plots/length_dist.png")
+plt.close()
+
+# GC DISTRIBUTION
+plt.figure()
+stats_df["GC"].hist(bins=30)
+plt.title("GC Content")
+plt.xlabel("%")
+plt.ylabel("Count")
+plt.savefig("plots/gc_dist.png")
+plt.close()
+
+# COVERAGE VS GC
+merged = stats_df.merge(
+    cov_df,
+    left_on="gene",
+    right_index=True
+)
+
+plt.figure()
+plt.scatter(merged["GC"], merged["read_count"])
+plt.xlabel("GC %")
+plt.ylabel("Reads")
+plt.title("GC Bias in Capture")
+plt.savefig("plots/gc_bias.png")
+plt.close()
+
+# PER CHROMOSOME
+chr_cov = stats_df.groupby("chr")["length"].sum()
+
+plt.figure()
+chr_cov.plot(kind="bar")
+plt.ylabel("Captured bp")
+plt.title("Chromosome Capture")
+plt.tight_layout()
+plt.savefig("plots/chromosome_capture.png")
+plt.close()
+
+# TOP GENES
+top = merged.sort_values("read_count", ascending=False).head(20)
+
+plt.figure(figsize=(10,5))
+plt.bar(top["gene"], top["read_count"])
+plt.xticks(rotation=90)
+plt.title("Top Captured Genes")
+plt.tight_layout()
+plt.savefig("plots/top_genes.png")
+plt.close()
+
+print("\nPIPELINE COMPLETE ✅")
+print("Generated:")
+print(" captured_genes.fasta")
+print(" simulated_reads.fastq")
+print(" capture_stats.csv")
+print(" gene_coverage.csv")
+print(" plots/")
